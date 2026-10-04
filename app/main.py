@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.4.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.5.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -323,6 +323,11 @@ class ArchiveIn(BaseModel):
     version: int = Field(ge=1)
 
 
+class CancelIn(BaseModel):
+    # 作废必须携带所查看的草稿版本
+    version: int = Field(ge=1)
+
+
 @app.get("/api/drafts")
 def get_drafts():
     return store.list_drafts()
@@ -348,6 +353,17 @@ def get_draft(draft_id: int):
 def archive_draft(draft_id: int, payload: ArchiveIn):
     try:
         return store.archive_draft(draft_id, payload.version)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+
+@app.post("/api/drafts/{draft_id}/cancel")
+def cancel_draft(draft_id: int, payload: CancelIn):
+    # 作废不再执行的炉次：保留记录（引用/参数快照/结果或无解原因），
+    # 标记 cancelled、版本 +1 并记录作废时间；未知 404，版本过期 /
+    # 已归档 / 已作废 409，失败不改变任何数据
+    try:
+        return store.cancel_draft(draft_id, payload.version)
     except store.StoreError as exc:
         _raise_store_error(exc)
 

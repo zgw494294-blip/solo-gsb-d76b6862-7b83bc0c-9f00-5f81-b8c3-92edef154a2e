@@ -9,7 +9,7 @@
 20°C 的后续曲线；首个违规档即拒绝续排。
 
 - 后端：Python + FastAPI（求解核心见 `app/solver.py`，纯标准库 BFS；
-  配方 / 炉次 / 归档用 SQLite 持久化，见 `app/db.py`、`app/store.py`；
+  配方 / 炉次 / 归档 / 作废用 SQLite 持久化，见 `app/db.py`、`app/store.py`；
   已归档炉次只读电费试算见 `app/electricity.py`，原曲线复用只读核验见
   `app/reuse.py`，归档快照离线 HTML 工艺单导出见 `app/exports.py`）
 - 前端：原生 HTML / CSS / JavaScript（`static/`，无任何前端构建与框架，
@@ -169,7 +169,8 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
   保存。**无解草稿同样保存**，只是不保留任何曲线。
 - **修改某配方时，所有引用它的“活动”草稿在同一事务里一起重算，版本各
   +1**：有解则写入新结果，无解则**清除旧曲线并记录原因**。已归档炉次不
-  再受配方修改影响。
+  再受配方修改影响；**已作废炉次保留记录但同样不参与重算**（见下文
+  「作废不再执行的炉次」）。
 - **重算中的读取行为（不等待本次求解）**：`PUT` 耗时主要在重算求解；
   **无论走哪条重算分支**（常规的锁外求解，或连续竞争后的兜底路径），
   求解期间都**不持读锁、不写任何数据**；此时 `GET /api/recipes`、
@@ -194,10 +195,10 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
   结果与版本一并更新）；反过来，新建保存前会复核引用配方版本，若修改
   已先生效则按新参数重新求解。二者按某一先后顺序串行生效，任何读取都
   不会看到“新参数 + 旧结果”的混合态。
-- 并发修改共享配方、并发创建引用炉次、停用/恢复与归档，仍与修改按**某一
-  先后顺序串行生效**：求解期间若有他次写操作先生效，本次重算结果会整体
-  作废并按最新状态重新求解（不会漏算新草稿、不会覆盖他次修改、不会改写
-  已归档冻结方案）。
+- 并发修改共享配方、并发创建引用炉次、停用/恢复与归档、作废，仍与修改按
+  **某一先后顺序串行生效**：求解期间若有他次写操作先生效，本次重算结果会
+  整体作废并按最新状态重新求解（不会漏算新草稿、不会覆盖他次修改、不会
+  改写已归档冻结方案、不会回写已作废炉次）。
 - **连续竞争时的读取行为**：若共享配方被连续修改、或不断出现引用该配方
   的新炉次，重算（或新建）的快照复核可能连续失效（默认 5 次）；此后转入
   兜底路径，但求解**仍然不持读锁**——上述三个 GET 在整个求解期间照常
@@ -207,11 +208,13 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
   他次写操作，从而一次提交成功、严格落在他次修改之后；`PUT` 与
   `POST /api/drafts` 依旧等整体提交后才返回（单进程部署，无后台任务、
   无新服务）。
-- 炉次读取（列表 / 详情）包含：`status`（`active` / `archived`）、
-  引用配方与引用时版本 `recipeVersions`、草稿 `version`、求解所用
-  `materials` 参数快照、`solvable`、`result`（完整求解结果）或 `reason`
-  （无解原因）。活动草稿的参数与结果一定是同一次求解写入的，**不会读到
-  “新参数 + 旧结果”的混合态**。
+- 炉次读取（列表 / 详情）包含：`status`（`active` / `cancelled` /
+  `archived`）、引用配方与引用时版本 `recipeVersions`、草稿 `version`、
+  求解所用 `materials` 参数快照、`solvable`、`result`（完整求解结果）或
+  `reason`（无解原因），以及 `archivedAt` / `cancelledAt`（未归档 / 未
+  作废时为 `null`）。活动草稿的参数与结果一定是同一次求解写入的，
+  **不会读到“新参数 + 旧结果”的混合态**；已作废草稿保留作废前的参数
+  快照与结果或无解原因（作废不重算）。
 
 ### 归档核准方案 `POST /api/drafts/{id}/archive`
 
@@ -224,6 +227,30 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
   后到的归档会收到 409，先到的归档冻结旧版本；
 - 成功 → 状态变为 `archived`，**冻结当时的材料参数、草稿版本与完整求解
   结果**；此后配方再怎么改，只影响其余未归档炉次。
+
+### 作废不再执行的炉次 `POST /api/drafts/{id}/cancel`
+
+不再执行的炉次草稿可作废：**保留记录而非删除**。请求体 `{"version": N}`
+携带**你所查看的草稿版本**：
+
+- 炉次 ID 未知 → **404**；
+- 版本与当前不一致（期间配方被改过、或已被作废过）→ **409**，响应体附
+  `currentVersion`；
+- 已归档 → **409**；已作废 → **409**（重复作废幂等拒绝）；
+- **可行与无解草稿均可作废**；失败（404/409）不改变任何数据；
+- 成功 → 状态变为 `cancelled`、**version +1**、记录作废时间
+  `cancelledAt`；原引用 `recipeIds` / `recipeVersions`、`materials` 参数
+  快照、`result` 或 `reason` **全部保留**；此后**不再允许归档**，也
+  **不能恢复为活动草稿**（没有恢复接口），并不再被配方整份修改 / 历史
+  恢复重算。
+
+作废状态保存在 SQLite 中，重启后保留；旧库中的未归档炉次升级后一律
+仍为 `active`。作废与重算、归档并发时按**某一先后顺序串行生效**：
+
+- **作废先提交**：重算提交复核时发现活动草稿集合漂移，整批作废重算，
+  **已经算出的结果不会回写到已作废炉次**；
+- **重算先提交**：草稿版本已 +1，携带旧版本的作废收到 **409**；
+- **归档先提交**：作废收到 **409**（反之，作废先提交则归档收到 409）。
 
 ### 前端：切换炉次时的请求编排（响应不串用）
 
@@ -298,8 +325,9 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | POST | `/api/recipes/{id}/enable` | 恢复配方为可用（200；未知 404） |
 | GET | `/api/drafts` | 列出全部炉次（含状态/参数/版本/结果或无解原因） |
 | POST | `/api/drafts` | 按 2～3 个不同现有配方 ID 创建炉次并从空记录求解（201；引用已停用配方 422） |
-| GET | `/api/drafts/{id}` | 读取炉次详情（归档后返回冻结快照） |
-| POST | `/api/drafts/{id}/archive` | 携带查看版本归档（过期 409 / 无解 422） |
+| GET | `/api/drafts/{id}` | 读取炉次详情（归档后返回冻结快照；作废后返回保留快照与作废时间） |
+| POST | `/api/drafts/{id}/archive` | 携带查看版本归档（过期/已作废 409、无解 422） |
+| POST | `/api/drafts/{id}/cancel` | 携带查看版本作废（保留记录；未知 404；过期/已归档/已作废 409） |
 | POST | `/api/drafts/{id}/reuse-check` | 已归档炉次原曲线复用检查（只读当前配方，不重新求解；未知 404 / 未归档 422） |
 | POST | `/api/drafts/{id}/electricity` | 已归档炉次电费试算（只读冻结曲线，不保存；未知 404 / 未归档或参数非法 422） |
 | GET | `/api/drafts/{id}/sheet` | 下载已归档炉次的单份离线 HTML 工艺单（UTF-8 HTML 附件；未知 404 / 未归档 422；只读归档快照，不写库） |
@@ -655,6 +683,45 @@ curl -sS -X POST http://localhost:8000/api/drafts/1/archive \
 归档成功后再次 `PUT /api/recipes/1` 只影响其他**未归档**炉次；
 `GET /api/drafts/1` 永远返回归档时冻结的版本、参数与结果。
 
+### 作废：携带所查看的版本（可直接复制执行）
+
+```bash
+# 正常作废（当前查看的就是 v1）：状态变为 cancelled、版本 +1、记录作废时间，
+# 引用、参数快照与求解结果全部保留
+curl -sS -X POST http://localhost:8000/api/drafts/1/cancel \
+  -H 'Content-Type: application/json' -d '{"version":1}'
+# 200，节选：
+# {"id":1,"status":"cancelled","version":2,
+#  "recipeIds":[1,2],"recipeVersions":{"1":1,"2":1},
+#  "materials":[...作废前快照...],"result":{...原完整结果...},
+#  "cancelledAt":"2026-10-04T08:00:00Z","archivedAt":null, ...}
+
+# 无解草稿同样可作废（reason 保留，result 仍为 null）
+
+# 期间配方被改过（草稿已到 v3），仍带 v2 作废 → 409
+curl -sS -X POST http://localhost:8000/api/drafts/1/cancel \
+  -H 'Content-Type: application/json' -d '{"version":2}'
+# 409：{"detail":{"detail":"炉次草稿已过期：你查看的是版本 2，当前为版本 3，请重新读取后再作废。",
+#                 "currentVersion":3}}
+
+# 重复作废 / 已归档后作废 → 409；未知炉次 → 404；均不改变任何数据
+curl -sS -i -X POST http://localhost:8000/api/drafts/1/cancel \
+  -H 'Content-Type: application/json' -d '{"version":2}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"detail":"该炉次已作废，不能重复作废。","currentVersion":2}}
+curl -sS -i -X POST http://localhost:8000/api/drafts/999/cancel \
+  -H 'Content-Type: application/json' -d '{"version":1}'
+# HTTP/1.1 404 Not Found
+# {"detail":"炉次草稿 999 不存在。"}
+```
+
+作废后该炉次**不再允许归档**（归档返回 409），也不再被
+`PUT /api/recipes/{id}` 或 `POST /api/recipes/{id}/restore` 重算——
+重算只覆盖其余活动草稿；`GET /api/drafts` 与 `GET /api/drafts/1` 继续
+返回该炉次（`status:"cancelled"` 与 `cancelledAt`），重启后状态保留。
+作废与重算并发时按先后顺序生效：作废先提交，则重算不会把新结果回写到
+它；重算先提交（版本已 +1），则旧版本的作废收到 409。
+
 ### 已归档炉次电费试算 `POST /api/drafts/{id}/electricity`
 
 对**已归档**炉次的冻结温度曲线做只读电费试算：不保存试算、不改动方案；
@@ -897,13 +964,13 @@ content-disposition: attachment; filename="draft-1-v1-sheet.html";
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / 复用检查 / 电费试算 / 工艺单下载）
+│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / cancel / 复用检查 / 电费试算 / 工艺单下载）
 │   ├── solver.py      # 规则常量、校验与 BFS 求解（配方与草稿复用）
 │   ├── reuse.py       # 已归档炉次原曲线复用检查（只读核验，不重新求解）
 │   ├── electricity.py # 已归档炉次电费试算（跨小时/午夜分摊、逐档与总费用舍入）
 │   ├── exports.py     # 已归档炉次单份离线 HTML 工艺单渲染（纯归档快照，样式内嵌）
 │   ├── db.py          # SQLite 连接、建表、全局读锁与写操作互斥锁
-│   └── store.py       # 配方 / 炉次草稿 / 归档 / 归档曲线只读 / 复用检查 / 工艺单快照 的事务化读写
+│   └── store.py       # 配方 / 炉次草稿 / 归档 / 作废 / 归档曲线只读 / 复用检查 / 工艺单快照 的事务化读写
 ├── static/
 │   ├── index.html     # 页面（编排求解 / 材料配方 / 炉次草稿 三个标签页）
 │   ├── styles.css     # 样式

@@ -17,6 +17,14 @@
 参数历史（recipe_versions 表）只追加：创建配方记版本 1，每次成功的
 整份修改（含恢复）在同一事务里追加新版本行；停用 / 恢复可用状态不记
 历史。旧库启动时仅对每个配方补记当前版本，重复启动不重复补记。
+
+炉次作废（cancel_draft）保留记录而非删除：标记 status='cancelled'、
+版本 +1 并记录作废时间，原引用、参数快照、结果或无解原因全部保留；
+作废炉次不再参与配方修改 / 历史恢复的重算（重算的活动草稿集合始终
+排除已作废），也不再允许归档。作废与重算、归档并发时按某一先后顺序
+生效：作废先提交则重算复核发现集合漂移、整批作废重算（已算出的结果
+不会回写到已作废炉次）；重算先提交则旧版本作废收到 409；归档先提交
+则作废收到 409。
 """
 
 from __future__ import annotations
@@ -122,10 +130,12 @@ def _draft_dict(row) -> dict:
     """组装炉次草稿读取结构：状态、参数、版本、结果或无解原因。
 
     活动草稿的 materials 与 result/reason 是同一次求解一起写入的快照；
-    已归档草稿则读取归档时冻结的快照，二者绝不会混用。
+    已归档草稿则读取归档时冻结的快照，二者绝不会混用。已作废草稿保留
+    作废前的参数快照与结果/原因（作废不重算），并附作废时间。
     """
     recipe_ids = json.loads(row["recipe_ids"])
     archived = row["archive_id"] is not None
+    cancelled = not archived and row["status"] == "cancelled"
 
     if archived:
         materials = json.loads(row["archived_materials_json"])
@@ -143,7 +153,9 @@ def _draft_dict(row) -> dict:
     return {
         "id": row["id"],
         "name": row["name"],
-        "status": "archived" if archived else "active",
+        "status": (
+            "archived" if archived else ("cancelled" if cancelled else "active")
+        ),
         "recipeIds": recipe_ids,
         "recipeVersions": recipe_versions,
         "version": row["archived_draft_version"] if archived else row["version"],
@@ -154,6 +166,7 @@ def _draft_dict(row) -> dict:
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
         "archivedAt": row["archived_at"],
+        "cancelledAt": row["cancelled_at"] if cancelled else None,
     }
 
 
@@ -406,8 +419,9 @@ def set_recipe_status(recipe_id: int, status: str) -> dict:
 def _snapshot_recipe_recompute(recipe_id: int, history_version: int | None = None) -> dict:
     """在已持有全局锁时读取修改所需快照（只读，不写任何数据）。
 
-    包含：目标配方当前行、所有引用它的活动草稿，以及这些草稿各自引用
-    配方的当前行。全部读取自同一连接、同一锁时点，状态彼此自洽。
+    包含：目标配方当前行、所有引用它的活动草稿（未归档且未作废；已作废
+    炉次保留记录但不再参与重算），以及这些草稿各自引用配方的当前行。
+    全部读取自同一连接、同一锁时点，状态彼此自洽。
 
     history_version 不为 None 时（从历史恢复），同时读取目标历史版本行。
     恢复入口在调用本函数后才复核「携带的当前版本是否过期」，为保证
@@ -437,7 +451,8 @@ def _snapshot_recipe_recompute(recipe_id: int, history_version: int | None = Non
             for d in conn.execute(
                 """SELECT d.* FROM drafts d
                    LEFT JOIN archives a ON a.draft_id = d.id
-                   WHERE a.id IS NULL ORDER BY d.id"""
+                   WHERE a.id IS NULL AND d.status = 'active'
+                   ORDER BY d.id"""
             ).fetchall()
             if recipe_id in json.loads(d["recipe_ids"])
         ]
@@ -528,12 +543,13 @@ def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict, strict: bool 
     """锁内、单条事务内复核漂移并整体提交；返回受影响草稿 ID。
 
     任一复核不过即说明快照后有他次写操作生效（并发修改共享配方、创建引用
-    炉次、归档等）：普通整份修改（strict=False）返回 None，让调用方整批
-    作废、刷新快照重算，绝不覆盖他次修改、不漏算新草稿、不触碰已归档冻结
-    方案；从历史恢复（strict=True）**不允许重试**——普通修改先于恢复提交
-    时，即便恢复已完成求解也直接抛 Conflict（409），由调用方放弃本次恢复，
-    绝不重试后覆盖新修改。复核通过后，配方新参数/版本、新追加的参数历史
-    与全部草稿的新参数快照、结果/原因、版本在同一事务里一起生效。
+    炉次、归档、作废等）：普通整份修改（strict=False）返回 None，让调用方
+    整批作废、刷新快照重算，绝不覆盖他次修改、不漏算新草稿、不触碰已归档
+    冻结方案、不回写已作废炉次；从历史恢复（strict=True）**不允许重试**——
+    普通修改先于恢复提交时，即便恢复已完成求解也直接抛 Conflict（409），
+    由调用方放弃本次恢复，绝不重试后覆盖新修改。复核通过后，配方新参数/
+    版本、新追加的参数历史与全部草稿的新参数快照、结果/原因、版本在同一
+    事务里一起生效。
     """
 
     def drift(current: int | None = None) -> None:
@@ -553,21 +569,22 @@ def _commit_recipe_recompute(conn, recipe_id: int, prepared: dict, strict: bool 
         drift(target["version"])  # 普通修改重试；恢复：他次修改已先生效，直接 409
         return None
 
-    # 受影响草稿集合必须与快照一致：不多（不能改写已归档/新建外的草稿）、
-    # 不少（引用该配方的新草稿必须纳入）
+    # 受影响草稿集合必须与快照一致：不多（不能改写已归档/已作废/新建外的
+    # 草稿）、不少（引用该配方的新草稿必须纳入）
     current_active = [
         d
         for d in conn.execute(
             """SELECT d.* FROM drafts d
                LEFT JOIN archives a ON a.draft_id = d.id
-               WHERE a.id IS NULL ORDER BY d.id"""
+               WHERE a.id IS NULL AND d.status = 'active'
+               ORDER BY d.id"""
         ).fetchall()
         if recipe_id in json.loads(d["recipe_ids"])
     ]
     by_id = {d["id"]: d for d in current_active}
     expected_ids = {d["id"] for d in prepared["drafts"]}
     if set(by_id) != expected_ids:
-        drift()  # 快照后有草稿被归档，或有引用该配方的新炉次创建
+        drift()  # 快照后有草稿被归档/作废，或有引用该配方的新炉次创建
         return None
 
     for pd in prepared["drafts"]:
@@ -815,7 +832,7 @@ def archive_draft(draft_id: int, expected_version: int) -> dict:
 
     - 携带所查看的草稿版本：与当前版本不一致 => 409（附当前版本）；
     - 草稿当前无解 => 422（不改变任何状态）；
-    - 已归档 => 409；
+    - 已归档 => 409；已作废 => 409（作废炉次不再允许归档）；
     - 成功则冻结当时的材料参数、草稿版本与完整求解结果；此后配方修改
       不再影响该炉次。
     """
@@ -829,6 +846,8 @@ def archive_draft(draft_id: int, expected_version: int) -> dict:
                 raise NotFound(f"炉次草稿 {draft_id} 不存在。")
             if row["archive_id"] is not None:
                 raise Conflict("该炉次已归档，不能重复归档。", row["version"])
+            if row["status"] == "cancelled":
+                raise Conflict("该炉次已作废，不能归档。", row["version"])
             if row["version"] != expected_version:
                 raise Conflict(
                     f"炉次草稿已过期：你查看的是版本 {expected_version}，"
@@ -851,6 +870,49 @@ def archive_draft(draft_id: int, expected_version: int) -> dict:
                     row["result_json"],
                     now,
                 ),
+            )
+        return get_draft(draft_id)
+
+
+def cancel_draft(draft_id: int, expected_version: int) -> dict:
+    """作废不再执行的炉次草稿：保留记录而非删除。
+
+    - 未知炉次 => 404；
+    - 已归档 => 409；已作废 => 409（重复作废幂等拒绝）；
+    - 携带的查看版本与当前不一致 => 409（附当前版本）；
+    - 可行与无解草稿均可作废；成功则标记 status='cancelled'、version +1、
+      记录作废时间，原引用、参数快照、结果或无解原因全部保留；此后不再
+      允许归档，也不再被配方整份修改 / 历史恢复重算。
+
+    与重算、归档并发时按某一先后顺序串行生效（同一把写互斥锁 + 单条
+    事务）：作废先提交，则重算提交复核时发现活动草稿集合漂移、整批作废
+    重算，已算出的结果不会回写到已作废炉次；重算先提交（版本已 +1），
+    则携带旧版本的作废收到 409；归档先提交，则作废收到 409。
+    """
+    now = _now()
+    with write_lock(), lock(), connect() as conn:
+        with _tx(conn):
+            row = conn.execute(
+                _DRAFT_SELECT + " WHERE d.id=?", (draft_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+            if row["archive_id"] is not None:
+                raise Conflict("该炉次已归档，不能作废。", row["version"])
+            if row["status"] == "cancelled":
+                raise Conflict("该炉次已作废，不能重复作废。", row["version"])
+            if row["version"] != expected_version:
+                raise Conflict(
+                    f"炉次草稿已过期：你查看的是版本 {expected_version}，"
+                    f"当前为版本 {row['version']}，请重新读取后再作废。",
+                    row["version"],
+                )
+            # 只切换状态与版本：引用、参数快照、结果或无解原因原样保留
+            conn.execute(
+                """UPDATE drafts SET status='cancelled', version=version+1,
+                       cancelled_at=?, updated_at=?
+                   WHERE id=?""",
+                (now, now, draft_id),
             )
         return get_draft(draft_id)
 

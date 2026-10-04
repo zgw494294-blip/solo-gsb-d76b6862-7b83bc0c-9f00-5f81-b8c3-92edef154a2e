@@ -69,12 +69,17 @@ CREATE TABLE IF NOT EXISTS drafts (
     recipe_ids  TEXT    NOT NULL,
     -- 上次求解时各配方的版本（{recipeId: recipeVersion}）
     recipe_versions_json TEXT NOT NULL DEFAULT '{}',
+    -- 'active' 活动（默认）/ 'cancelled' 已作废：作废保留记录而非删除，
+    -- 不再参与配方修改/恢复的重算，也不可再归档；已归档由 archives 表决定
+    status      TEXT    NOT NULL DEFAULT 'active',
     version     INTEGER NOT NULL DEFAULT 1,
     -- 本次求解所用材料参数快照（与 result_json 严格同版）
     materials_json TEXT NOT NULL,
     solvable    INTEGER NOT NULL,
     result_json TEXT,        -- solvable=0 时为 NULL（无旧曲线）
     reason      TEXT,        -- solvable=0 时的中文原因
+    -- 作废时间（UTC ISO 字符串）；未作废为 NULL
+    cancelled_at TEXT,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
 );
@@ -118,7 +123,9 @@ def _migrate(conn) -> None:
     1. recipes 缺少 status 列时补上，既有配方默认可用；
     2. recipe_versions 历史表对旧库只补记每个配方的**当前 version**（历史
        参数无法追溯）；INSERT OR IGNORE + 「已有历史即不补记」双重保证
-       重复启动不会重复补记，此后新创建 / 修改 / 恢复照常只追加。
+       重复启动不会重复补记，此后新创建 / 修改 / 恢复照常只追加；
+    3. drafts 缺少 status / cancelled_at 列时补上：旧库中的未归档炉次
+       一律为 active（cancelled_at 为 NULL），重启后保留作废状态。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(recipes)").fetchall()}
     if "status" not in cols:
@@ -134,6 +141,16 @@ def _migrate(conn) -> None:
                SELECT id, version, name, hold_low, hold_high, duration, tolerance
                FROM recipes"""
         )
+
+    draft_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(drafts)").fetchall()
+    }
+    if "status" not in draft_cols:
+        conn.execute(
+            "ALTER TABLE drafts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+        )
+    if "cancelled_at" not in draft_cols:
+        conn.execute("ALTER TABLE drafts ADD COLUMN cancelled_at TEXT")
 
 
 @contextmanager
