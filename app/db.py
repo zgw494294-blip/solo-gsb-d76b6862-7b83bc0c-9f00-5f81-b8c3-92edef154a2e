@@ -5,13 +5,13 @@
 - 读操作只经过进程内全局读锁（_LOCK），拿到的一定是同一版本下自洽的
   参数与结果。
 - 写操作一律按「写互斥锁（_WRITE_LOCK）→ 全局读锁」的顺序取锁，保证
-  「配方修改」「归档」「停用」「新建炉次」按某一先后顺序整体生效。
-  配方重算与新建炉次的耗时求解都在两把锁之外进行，期间读操作仍可
-  进入并读到上一次完整提交的状态（新草稿在整体提交前不可见），只有
-  最后的复核+提交瞬间需要短暂持锁；连续竞争导致快照复核反复失效时，
-  兜底路径持写互斥锁走完 快照→求解→提交 全程——其他写操作在写互斥
-  锁上排队（读操作不经过它），求解期间读取照常返回上一整次提交的
-  状态。
+  「配方修改」「归档」「作废」「停用」「新建炉次」按某一先后顺序整体
+  生效。配方重算与新建炉次的耗时求解都在两把锁之外进行，期间读操作
+  仍可进入并读到上一次完整提交的状态（新草稿在整体提交前不可见），
+  只有最后的复核+提交瞬间需要短暂持锁；连续竞争导致快照复核反复失效
+  时，兜底路径持写互斥锁走完 快照→求解→提交 全程——其他写操作在写
+  互斥锁上排队（读操作不经过它），求解期间读取照常返回上一整次提交
+  的状态。
 """
 
 from __future__ import annotations
@@ -75,6 +75,11 @@ CREATE TABLE IF NOT EXISTS drafts (
     solvable    INTEGER NOT NULL,
     result_json TEXT,        -- solvable=0 时为 NULL（无旧曲线）
     reason      TEXT,        -- solvable=0 时的中文原因
+    -- 'active' 活动（默认）/ 'cancelled' 已作废；已归档由 archives 行判定。
+    -- 作废保留记录（引用、参数快照、结果或无解原因原样保留），版本 +1 并
+    -- 记录 cancelled_at，此后不能归档、不被配方重算 / 历史恢复纳入。
+    status      TEXT    NOT NULL DEFAULT 'active',
+    cancelled_at TEXT,       -- status='cancelled' 时的作废时间（UTC）
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
 );
@@ -118,13 +123,25 @@ def _migrate(conn) -> None:
     1. recipes 缺少 status 列时补上，既有配方默认可用；
     2. recipe_versions 历史表对旧库只补记每个配方的**当前 version**（历史
        参数无法追溯）；INSERT OR IGNORE + 「已有历史即不补记」双重保证
-       重复启动不会重复补记，此后新创建 / 修改 / 恢复照常只追加。
+       重复启动不会重复补记，此后新创建 / 修改 / 恢复照常只追加；
+    3. drafts 缺少 status / cancelled_at 列时补上：既有未归档炉次一律保持
+       active（已归档由 archives 行判定，与 status 无关），作废时间为空。
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(recipes)").fetchall()}
     if "status" not in cols:
         conn.execute(
             "ALTER TABLE recipes ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
         )
+
+    draft_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(drafts)").fetchall()
+    }
+    if "status" not in draft_cols:
+        conn.execute(
+            "ALTER TABLE drafts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+        )
+    if "cancelled_at" not in draft_cols:
+        conn.execute("ALTER TABLE drafts ADD COLUMN cancelled_at TEXT")
 
     existing = conn.execute("SELECT COUNT(*) FROM recipe_versions").fetchone()[0]
     if existing == 0:
